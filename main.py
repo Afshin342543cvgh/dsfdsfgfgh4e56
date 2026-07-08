@@ -15,6 +15,8 @@ from typing import Optional, Iterator, Tuple, List
 
 from telethon import TelegramClient, events
 from telethon.tl.custom.message import Message
+from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.types import ReactionEmoji
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
 from telethon.errors import (
     PersistentTimestampOutdatedError,
@@ -1482,49 +1484,67 @@ async def factory_loop() -> None:
 #  Rescue Listener — با پشتیبانی از بروزرسانی لحظه‌ای (مورد ۱۰)
 # ══════════════════════════════════════════════════
 
+async def safe_click(msg, row, col):
+    """یک تابع کمکی برای فرستادن کلیک‌های پس‌زمینه بدون ایجاد خطای سرخود چت"""
+    try:
+        await msg.click(row, col)
+    except Exception:
+        pass  # ارورهای غیب شدن دکمه رو نادیده بگیر تا لاگ کثیف نشه
+
+async def safe_reaction(chat_id, msg_id, emojilist):
+    """یک تابع کمکی برای فرستادن ری‌اکشن بدون کرش دادن برنامه"""
+    try:
+        await client(SendReactionRequest(peer=chat_id, msg_id=msg_id, reaction=emojilist))
+    except Exception:
+        pass
+
 async def sniper_click(msg: Message, action_type: str):
     raw_text = msg.text or ""
 
     if ("یک پیشی خیابونی توی شهر پیدا شد" in raw_text or "لطفا به پیشی" in raw_text) and "نجات داد" not in raw_text:
+        log.info(f"🎯 [پیشی شکار شد!] ──> شروع فاز اول ترکیبی (تایمرهای میلی‌ثانیه‌ای امن)...")
         
-        log.info(f"🎯 [پیشی شکار شد!] ──> شروع فاز اول ترکیبی (کلیک + ری‌اکشن)...")
+        # ۱. ری‌اکشن قلب اول
+        client.loop.create_task(safe_reaction(msg.chat_id, msg.id, [ReactionEmoji(emoticon='❤️')]))
+        await asyncio.sleep(0.05) # ۵ صدم ثانیه تاخیر برای دور زدن فلود تلگرام
+
+        # ۲. کلیک اول
+        client.loop.create_task(safe_click(msg, 0, 0))
+        await asyncio.sleep(0.05)
+
+        # ۳. حذف ری‌اکشن اول
+        client.loop.create_task(safe_reaction(msg.chat_id, msg.id, []))
+        await asyncio.sleep(0.05)
+
+        # ۴. کلیک دوم
+        client.loop.create_task(safe_click(msg, 0, 0))
+        await asyncio.sleep(0.05)
+
+        # ۵. ری‌اکشن قلب دوم
+        client.loop.create_task(safe_reaction(msg.chat_id, msg.id, [ReactionEmoji(emoticon='❤️')]))
+        await asyncio.sleep(0.05)
+
+        # ۶. کلیک سوم
+        client.loop.create_task(safe_click(msg, 0, 0))
+        await asyncio.sleep(0.05)
+
+        # ۷. حذف ری‌اکشن دوم
+        client.loop.create_task(safe_reaction(msg.chat_id, msg.id, []))
+        await asyncio.sleep(0.05)
+
+        client.loop.create_task(safe_reaction(msg.chat_id, msg.id, [ReactionEmoji(emoticon='❤️')]))
         
-        try:
-            # ۱. ری‌اکشن قلب اول
-            client.loop.create_task(client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[ReactionEmoji(emoticon='❤️')])))
-            
-            # ۲. کلیک اول
-            client.loop.create_task(msg.click(0, 0))
-            
-            # ۳. حذف ری‌اکشن اول (فرستادن لیست خالی [] یعنی پاک کردن ری‌اکشن)
-            client.loop.create_task(client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[])))
-            
-            # ۴. کلیک دوم
-            client.loop.create_task(msg.click(0, 0))
-            
-            # ۵. ری‌اکشن قلب دوم
-            client.loop.create_task(client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[ReactionEmoji(emoticon='❤️')])))
-            
-            # ۶. کلیک سوم
-            client.loop.create_task(msg.click(0, 0))
-            
-            # ۷. حذف ری‌اکشن دوم
-            client.loop.create_task(client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[])))
-
-            client.loop.create_task(client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[ReactionEmoji(emoticon='❤️')])))
-            
-            log.info("⚡️ فاز اول ترکیبی با موفقیت در کسری از ثانیه شلیک شد.")
-            
-        except Exception as e:
-            log.error(f"خطا در شلیک اولیه: {e}")
-
+        
         # ----------------------------------------
         # مهلت به سرور بازی و آپدیت وضعیت پیام
-        await asyncio.sleep(1.0)
-        msg = await client.get_messages(msg.chat_id, ids=msg.id)
+        await asyncio.sleep(0.8)
+        try:
+            msg = await client.get_messages(msg.chat_id, ids=msg.id)
+        except Exception:
+            return False
 
         # 🛡 فاز دوم (پیگیری امن در صورت غیب نشدن دکمه)
-        if msg.buttons:
+        if msg and msg.buttons:
             log.info("⚠️ دکمه هنوز هست؛ ورود به فاز دوم (۱۵ کلیک امن با تایمر)...")
             max_attempts = 15
             attempt = 0
@@ -1532,15 +1552,14 @@ async def sniper_click(msg: Message, action_type: str):
             while msg.buttons and attempt < max_attempts:
                 attempt += 1
                 try:
-                    client.loop.create_task(msg.click(0, 0))
-                    await asyncio.sleep(0.5)
+                    client.loop.create_task(safe_click(msg, 0, 0))
+                    await asyncio.sleep(0.6) # افزایش جزیی تایمر برای امنیت بیشتر اکانت
                     msg = await client.get_messages(msg.chat_id, ids=msg.id)
-                except Exception as e:
-                    log.error(f"❌ خطا در فاز دوم: {e}")
+                except Exception:
                     break
 
         # نتیجه نهایی
-        if not msg.buttons:
+        if not msg or not msg.buttons:
             log.info("✅ عالیه! دکمه با موفقیت غیب شد.")
             return True
         else:
@@ -1548,7 +1567,6 @@ async def sniper_click(msg: Message, action_type: str):
             return False
 
     return False
-
 
 async def rescue_listener() -> None:
     """
