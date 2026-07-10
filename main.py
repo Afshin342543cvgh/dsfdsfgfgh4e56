@@ -12,11 +12,10 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from typing import Optional, Iterator, Tuple, List
-
-from telethon import TelegramClient, events
-from telethon.tl.custom.message import Message
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import ReactionEmoji
+from telethon import TelegramClient, events
+from telethon.tl.custom.message import Message
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
 from telethon.errors import (
     PersistentTimestampOutdatedError,
@@ -56,11 +55,33 @@ GIVE_TO_CAT_BUTTON = "بده پیشی بخوره"
 PISHI_MSG_TEXT = "پیشی"
 FISH_MSG_TEXT  = "ماهی"
 
+# ── سیستم یخچال میویی ──
+FRIDGE_TRIGGER      = "یخچال میویی"
+FRIDGE_STORE_BUTTON = "بندازش تو یخچال"
+
+# حدس منطقی برای متن دکمه‌ی تایید شروع پخت — کلیک اصلی روی این مرحله «موقعیتی»
+# (ردیف ۰ ستون ۰) است، این متن فقط به‌عنوان fallback استفاده می‌شود؛ اگر متن
+# واقعی دکمه در ربات هدف چیز دیگری بود، فقط همین یک رشته را عوض کن.
+FRIDGE_COOK_CONFIRM_TEXT = "بپوخش"
+
+# لیست ایموجی موجودات دریایی قابل‌شناسایی — برای افزودن یک نوع ماهی/موجود جدید
+# در آینده فقط کافیه ایموجی‌اش رو به همین آرایه اضافه کنی، هیچ منطقی جای دیگه
+# نیاز به تغییر نداره (مطابق اصل «افزودن یک ردیف داده، نه بازنویسی موتور»).
+FRIDGE_CREATURE_EMOJIS = ["🐙", "🦑", "🐬", "🦭", "🦐", "🐟", "🦞", "🐡", "🐳", "🐋", "🦈"]
+
+FRIDGE_DEFAULT_POLL = 30  # ثانیه — فاصله بررسی وضعیت یخچال وقتی کاری در جریان نیست
+
+GROUP_NOT_SET_TEXT = "هیچ گروهی ست نشده است⛔"
+
 WAIT_FOR_BOT = 20  # ثانیه، سقف انتظار برای پاسخ بات هدف
 
 MENU_TRIGGER = ".سلف"
 
-# مقادیر پیش‌فرض گروه‌ها (فقط برای اولین اجرا / ساخت دیتابیس)
+# مقادیر زیر دیگر به‌صورت خودکار در دیتابیس درج نمی‌شوند (طبق درخواست: در اولین
+# اجرا هیچ آیدی عددی برای هیچ گروهی — از جمله یخچال — ست نشود). این ثابت‌ها فقط
+# به‌عنوان مرجع/مستندات نگه داشته شده‌اند و دیگر در init_db() استفاده نمی‌شوند؛
+# get_group()/get_group_list() اکنون در نبود مقدار، None یا [] برمی‌گردانند و
+# UI مربوطه دقیقاً عبارت GROUP_NOT_SET_TEXT را نشان می‌دهد.
 DEFAULT_RESCUE_GROUPS = [-1003184246310, -1003180169065, -1004296149068]
 DEFAULT_MEOW_GROUP    = -1003380347106
 DEFAULT_FISH_GROUP    = -1003180169065
@@ -102,17 +123,28 @@ DEFAULT_CONFIG = {
     "min_sell_price":     "55",
     "smuggling_wait_sec": "1800",
     "factory_wait_sec":   "3600",
+    # ── یخچال میویی ──
+    "refrigerator_food_value_min": "5",     # حداقل ارزش غذایی برای ذخیره در یخچال
+    "refrigerator_fish_value_max": "5000",  # سقف ارزش ماهیِ پخته‌شده برای تغذیه (بالاتر → فروش)
+    "fridge_capacity_max": "0",             # 0 یعنی هنوز از بازی سینک نشده
+    "fridge_poll_sec":     "30",
 }
 
-# مقادیر پیش‌فرض روشن/خاموش ماژول‌ها
+# مقادیر پیش‌فرض روشن/خاموش ماژول‌ها.
+# طبق درخواست: در اولین راه‌اندازی (دیتابیس خالی) فقط «سلف» روشن است و تمام
+# ماژول‌های دیگر — از جمله یخچال — کاملاً خاموش می‌مانند. این مقادیر فقط زمانی
+# اعمال می‌شوند که دیتابیس تازه ساخته شود (INSERT OR IGNORE)؛ روی دیتابیس‌های
+# موجود که این کلیدها را از قبل دارند هیچ تاثیری ندارد.
 DEFAULT_TOGGLES = {
-    "self_enabled":    "1",
-    "meow_enabled":    "1",
-    "pishi_enabled":   "1",
-    "fishing_enabled": "1",
-    "rescue_enabled":  "1",
-    "smuggling_enabled": "1",
-    "factory_enabled":   "1",
+    "self_enabled":         "1",
+    "meow_enabled":         "0",
+    "pishi_enabled":        "0",
+    "fishing_enabled":      "0",
+    "rescue_enabled":       "0",
+    "smuggling_enabled":    "0",
+    "factory_enabled":      "0",
+    "refrigerator_enabled": "0",
+    "fridge_synced_once":   "0",
 }
 
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
@@ -172,6 +204,28 @@ def init_db() -> None:
                 "CREATE TABLE IF NOT EXISTS config ("
                 "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
+            # مورد ۲ سند یخچال: جدول اختصاصی موجودی یخچال — هر ردیف یعنی یک نوع
+            # ماهی/موجود دریایی درون یخچال است (کلید = ایموجی → جلوگیری از تکرار).
+            # status: 'raw' (تازه ذخیره‌شده، پخت شروع نشده) | 'cooking' | 'cooked'
+            # miss_count/last_attempt_at: برای جلوگیری از تلاش بی‌وقفه روی ماهی‌ای
+            # که در یخچال واقعی پیدا نمی‌شود (مثلاً به‌خاطر ناهماهنگی دیتابیس محلی).
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS meow_refrigerator ("
+                "emoji TEXT PRIMARY KEY, "
+                "status TEXT NOT NULL DEFAULT 'raw', "
+                "added_at REAL NOT NULL, "
+                "cook_started_at REAL, "
+                "cook_ready_at REAL, "
+                "miss_count INTEGER NOT NULL DEFAULT 0, "
+                "last_attempt_at REAL)"
+            )
+            # ALTER TABLE ایمن برای دیتابیس‌هایی که از نسخه‌ی قبلی (بدون این دو
+            # ستون) آپدیت می‌شوند — روی دیتابیس تازه بی‌اثر است (ستون از قبل هست).
+            for col_def in ("miss_count INTEGER NOT NULL DEFAULT 0", "last_attempt_at REAL"):
+                try:
+                    c.execute(f"ALTER TABLE meow_refrigerator ADD COLUMN {col_def}")
+                except sqlite3.OperationalError:
+                    pass  # ستون از قبل وجود دارد
             c.execute("INSERT OR IGNORE INTO cat_stats (id, stomach) VALUES (1, 0)")
 
             for k, v in DEFAULT_CONFIG.items():
@@ -180,30 +234,10 @@ def init_db() -> None:
             for k, v in DEFAULT_TOGGLES.items():
                 c.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", (k, v))
 
-            c.execute(
-                "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
-                ("group_meow", str(DEFAULT_MEOW_GROUP)),
-            )
-            c.execute(
-                "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
-                ("group_pishi", str(DEFAULT_PISHI_GROUP)),
-            )
-            c.execute(
-                "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
-                ("group_fish", str(DEFAULT_FISH_GROUP)),
-            )
-            c.execute(
-                "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
-                ("group_rescue", ",".join(str(g) for g in DEFAULT_RESCUE_GROUPS)),
-            )
-            c.execute(
-                "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
-                ("smuggling_group", str(DEFAULT_SMUGGLING_GROUP)),
-            )
-            c.execute(
-                "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
-                ("factory_group", str(DEFAULT_FACTORY_GROUP)),
-            )
+            # مورد ۱ سند یخچال: در اولین اجرا هیچ آیدی عددی برای هیچ گروهی (میو،
+            # پیشی، ماهیگیری، خیابونی، قاچاق، کارخونه، یخچال) درج نمی‌شود. گروه‌ها
+            # تا وقتی کاربر با دستورهای .گروه_... مقداردهی نکند «ست‌نشده» می‌مانند
+            # و get_group()/get_group_list() برای آن‌ها None/[] برمی‌گردانند.
 
             c.execute("DELETE FROM config WHERE key IN ('pishi_msg', 'fish_msg')")
 
@@ -211,6 +245,7 @@ def init_db() -> None:
         log.info(f"[DB] Config Loaded ({table_count('config')} رکورد)")
         log.info(f"[DB] Timers Loaded ({table_count('timers')} رکورد)")
         log.info(f"[DB] Cat Stats Loaded ({table_count('cat_stats')} رکورد)")
+        log.info(f"[DB] Fridge Loaded ({table_count('meow_refrigerator')} رکورد)")
     except sqlite3.Error as e:
         log.error(f"[DB] خطای بحرانی در ساخت دیتابیس: {e}")
         raise SystemExit(1)
@@ -262,17 +297,32 @@ def cfg_bool_set(key: str, value: bool) -> None:
     cfg_set(key, "1" if value else "0")
 
 
-def get_group(key: str, default: int) -> int:
-    raw = cfg(key, str(default))
+def get_group(key: str, default: Optional[int] = None) -> Optional[int]:
+    """
+    خواندن آیدی یک گروه از دیتابیس.
+    برخلاف نسخه قبلی، اگر مقدار ست نشده باشد به یک آیدی هاردکدشده fallback
+    نمی‌شود — None برمی‌گردد. این باعث می‌شود:
+      • نمایش وضعیت بتواند دقیقاً GROUP_NOT_SET_TEXT را نشان دهد،
+      • حلقه‌ها بتوانند قبل از ارسال، ست‌نبودن گروه را تشخیص داده و رد شوند
+        (به‌جای ارسال ناخواسته به یک گروه پیش‌فرض قدیمی).
+    """
+    raw = cfg(key, "").strip()
+    if not raw:
+        return default
     try:
         return int(raw)
     except (ValueError, TypeError):
-        log.error(f"[DB] آیدی گروه خراب برای '{key}'='{raw}' — استفاده از پیش‌فرض {default}")
+        log.error(f"[DB] آیدی گروه خراب برای '{key}'='{raw}' — به‌عنوان ست‌نشده در نظر گرفته شد")
         return default
 
 
-def get_group_list(key: str, default: list) -> list:
-    raw = cfg(key, ",".join(str(g) for g in default))
+def get_group_list(key: str, default: Optional[list] = None) -> list:
+    """نسخه‌ی 'None-safe': اگر گروهی ست نشده باشد [] برمی‌گردد، نه یک لیست پیش‌فرض هاردکدشده."""
+    if default is None:
+        default = []
+    raw = cfg(key, "").strip()
+    if not raw:
+        return list(default)
     result = []
     for part in raw.split(","):
         part = part.strip()
@@ -282,7 +332,7 @@ def get_group_list(key: str, default: list) -> list:
             result.append(int(part))
         except ValueError:
             log.error(f"[DB] آیدی نامعتبر در '{key}': '{part}' — نادیده گرفته شد")
-    return result or default
+    return result if result else list(default)
 
 
 def get_last_run(key: str) -> float:
@@ -333,6 +383,177 @@ def set_stomach(v: int) -> None:
         log.error(f"[DB] خطا در ذخیره شکم: {e}")
 
 
+# ══════════════════════════════════════════════════
+#  لایه دیتابیس یخچال میویی (جدول meow_refrigerator)
+# ══════════════════════════════════════════════════
+
+def fridge_has(emoji: str) -> bool:
+    """آیا این نوع ماهی/موجود از قبل در یخچال (محلی) موجود است؟ — مورد ۴ شرط ۳."""
+    try:
+        with db_cursor() as c:
+            c.execute("SELECT 1 FROM meow_refrigerator WHERE emoji=?", (emoji,))
+            return c.fetchone() is not None
+    except sqlite3.Error as e:
+        log.error(f"[FRIDGE-DB] خطا در بررسی موجودی '{emoji}': {e}")
+        return False
+
+
+def fridge_add(emoji: str) -> None:
+    """ثبت یک ماهی تازه‌ذخیره‌شده با وضعیت 'raw'."""
+    try:
+        with db_cursor() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO meow_refrigerator (emoji, status, added_at) "
+                "VALUES (?, 'raw', ?)",
+                (emoji, time.time()),
+            )
+        log.info(f"[FRIDGE-DB] ماهی '{emoji}' به یخچال اضافه شد (وضعیت: raw).")
+    except sqlite3.Error as e:
+        log.error(f"[FRIDGE-DB] خطا در افزودن '{emoji}': {e}")
+
+
+def fridge_remove(emoji: str) -> None:
+    """حذف یک اسلات یخچال — بعد از فروش/تغذیه‌ی نهایی ماهیِ پخته‌شده."""
+    try:
+        with db_cursor() as c:
+            c.execute("DELETE FROM meow_refrigerator WHERE emoji=?", (emoji,))
+        log.info(f"[FRIDGE-DB] ماهی '{emoji}' از یخچال حذف شد (اسلات آزاد شد).")
+    except sqlite3.Error as e:
+        log.error(f"[FRIDGE-DB] خطا در حذف '{emoji}': {e}")
+
+
+def fridge_reset_all() -> None:
+    """
+    پاک‌سازی کامل جدول محلی یخچال — طبق درخواست کاربر، هر بار ماژول یخچال از
+    خاموش به روشن تغییر می‌کند، دیتابیس محلی کاملاً خالی می‌شود و پرچم
+    fridge_synced_once هم پاک می‌شود تا دقیقاً یک سینک تازه (fridge_sync_if_empty)
+    در دور بعدی fridge_loop انجام شود — نه کمتر، نه بیشتر.
+    """
+    try:
+        with db_cursor() as c:
+            c.execute("DELETE FROM meow_refrigerator")
+        cfg_set("fridge_capacity_max", "0")
+        cfg_bool_set("fridge_synced_once", False)
+        log.info("[FRIDGE-DB] دیتابیس محلی یخچال کاملاً پاک شد — یک سینک تازه در دور بعدی انجام می‌شود.")
+    except sqlite3.Error as e:
+        log.error(f"[FRIDGE-DB] خطا در پاک‌سازی کامل: {e}")
+
+
+def fridge_set_status(
+    emoji: str,
+    status: str,
+    cook_started_at: Optional[float] = None,
+    cook_ready_at: Optional[float] = None,
+) -> None:
+    """تغییر وضعیت یک ردیف یخچال؛ در صورت وجود، زمان‌های شروع/پایان پخت هم ثبت می‌شوند."""
+    try:
+        with db_cursor() as c:
+            if cook_started_at is not None or cook_ready_at is not None:
+                c.execute(
+                    "UPDATE meow_refrigerator SET status=?, cook_started_at=?, cook_ready_at=? "
+                    "WHERE emoji=?",
+                    (status, cook_started_at, cook_ready_at, emoji),
+                )
+            else:
+                c.execute("UPDATE meow_refrigerator SET status=? WHERE emoji=?", (status, emoji))
+        log.info(f"[FRIDGE-DB] وضعیت '{emoji}' → '{status}'")
+    except sqlite3.Error as e:
+        log.error(f"[FRIDGE-DB] خطا در تغییر وضعیت '{emoji}': {e}")
+
+
+def fridge_list_raw() -> List[str]:
+    """ماهی‌هایی که تازه ذخیره شده‌اند ولی هنوز فرآیند پخت برایشان شروع نشده."""
+    try:
+        with db_cursor() as c:
+            c.execute("SELECT emoji FROM meow_refrigerator WHERE status='raw'")
+            return [r[0] for r in c.fetchall()]
+    except sqlite3.Error as e:
+        log.error(f"[FRIDGE-DB] خطا در خواندن لیست خام‌ها: {e}")
+        return []
+
+
+def fridge_due_now() -> List[str]:
+    """
+    ماهی‌هایی که آماده‌ی جمع‌آوری‌اند: یا از قبل به‌عنوان 'cooked' علامت خورده‌اند
+    (مثلاً از طریق سینک اولیه با یخچالی که از قبل چیز پخته‌شده داشته)، یا در حال
+    پخت بوده و زمانشان به پایان رسیده.
+    """
+    try:
+        with db_cursor() as c:
+            c.execute(
+                "SELECT emoji FROM meow_refrigerator WHERE status='cooked' "
+                "OR (status='cooking' AND cook_ready_at IS NOT NULL AND cook_ready_at<=?)",
+                (time.time(),),
+            )
+            return [r[0] for r in c.fetchall()]
+    except sqlite3.Error as e:
+        log.error(f"[FRIDGE-DB] خطا در خواندن لیست آماده‌ی جمع‌آوری: {e}")
+        return []
+
+
+def fridge_next_ready_at() -> Optional[float]:
+    """نزدیک‌ترین زمانی که یک ماهیِ در-حال-پخت آماده می‌شود — برای محاسبه‌ی خواب پویا در fridge_loop."""
+    try:
+        with db_cursor() as c:
+            c.execute(
+                "SELECT MIN(cook_ready_at) FROM meow_refrigerator "
+                "WHERE status='cooking' AND cook_ready_at IS NOT NULL"
+            )
+            row = c.fetchone()
+            return row[0] if row and row[0] is not None else None
+    except sqlite3.Error as e:
+        log.error(f"[FRIDGE-DB] خطا در خواندن نزدیک‌ترین زمان آماده‌شدن: {e}")
+        return None
+
+
+FRIDGE_MISS_BACKOFF_SEC = 60   # حداقل فاصله بین دو تلاش متوالی برای همون ماهی بعد از یک شکست
+FRIDGE_MISS_GIVE_UP = 10       # بعد از این تعداد شکست پیاپی، دیگر تلاش خودکار نمی‌شود (نیاز به بررسی دستی)
+
+
+def fridge_should_attempt(emoji: str) -> bool:
+    """
+    آیا الان زمان مناسبی برای تلاش دوباره روی این ماهی هست؟ اگر اخیراً (کمتر از
+    FRIDGE_MISS_BACKOFF_SEC پیش) یک تلاش شکست‌خورده داشته، صبر می‌کنیم تا از
+    درخواست‌های پشت‌سرهم و بی‌فایده به تلگرام جلوگیری شود.
+    """
+    try:
+        with db_cursor() as c:
+            c.execute(
+                "SELECT miss_count, last_attempt_at FROM meow_refrigerator WHERE emoji=?",
+                (emoji,),
+            )
+            row = c.fetchone()
+            if not row:
+                return True
+            miss_count, last_attempt_at = row
+            if miss_count >= FRIDGE_MISS_GIVE_UP:
+                return False
+            if last_attempt_at and (time.time() - last_attempt_at) < FRIDGE_MISS_BACKOFF_SEC:
+                return False
+            return True
+    except sqlite3.Error as e:
+        log.error(f"[FRIDGE-DB] خطا در بررسی زمان تلاش مجدد '{emoji}': {e}")
+        return True
+
+
+def fridge_record_attempt(emoji: str, success: bool) -> None:
+    """ثبت نتیجه‌ی یک تلاش (موفق/ناموفق) روی این ماهی — برای مدیریت backoff."""
+    try:
+        with db_cursor() as c:
+            if success:
+                c.execute(
+                    "UPDATE meow_refrigerator SET miss_count=0, last_attempt_at=? WHERE emoji=?",
+                    (time.time(), emoji),
+                )
+            else:
+                c.execute(
+                    "UPDATE meow_refrigerator SET miss_count=miss_count+1, last_attempt_at=? WHERE emoji=?",
+                    (time.time(), emoji),
+                )
+    except sqlite3.Error as e:
+        log.error(f"[FRIDGE-DB] خطا در ثبت نتیجه‌ی تلاش '{emoji}': {e}")
+
+
 def secs_left(key: str, interval: int) -> float:
     last = get_last_run(key)
     return 0.0 if last == 0.0 else max(0.0, interval - (time.time() - last))
@@ -362,6 +583,26 @@ def fmt_timer_line(key: str, interval: int, enabled: bool) -> str:
 
 def onoff(flag: bool) -> str:
     return "🟢 روشن" if flag else "🔴 خاموش"
+
+
+def fmt_fridge_timer_line() -> str:
+    """
+    برخلاف میو/پیشی/ماهیگیری/قاچاق/کارخونه، یخچال یک فاصله‌ی زمانی ثابت ندارد
+    (بسته به سطح ماهی متغیر است)؛ به‌جای شمارش معکوس ساختگی، وضعیت واقعی نمایش
+    داده می‌شود: خاموش / در حال پخت (با زمان واقعی باقی‌مانده) / آماده‌ی شروع
+    پخت / منتظر ماهی جدید.
+    """
+    if not cfg_bool("refrigerator_enabled", False):
+        return "🔴 خاموش"
+    next_ready = fridge_next_ready_at()
+    if next_ready is not None:
+        remaining = max(0.0, next_ready - time.time())
+        return f"🍳 در حال پخت — مانده: {fmt_time(remaining)}"
+    if fridge_due_now():
+        return "📦 ماهی پخته‌شده منتظر جمع‌آوری است"
+    if fridge_list_raw():
+        return "📥 آماده‌ی شروع پخت"
+    return "⏳ منتظر ماهی جدید"
 
 
 # ══════════════════════════════════════════════════
@@ -421,8 +662,18 @@ WAREHOUSE_CAPACITY_RE = re.compile(
 
 
 def _normalize(text: Optional[str]) -> str:
-    """حذف نیم‌فاصله برای ساده‌ترشدن تطبیق عبارات فارسی."""
-    return (text or "").replace("\u200c", " ")
+    """
+    حذف نیم‌فاصله، نشانه‌های نامرئی جهت‌دهی متن (RLM/LRM/ALM)، و بک‌تیک‌های
+    مارک‌داون (`) که ربات‌های هدف اغلب دور اعداد می‌گذارند (مثلاً «ظرفیت یخچال :
+    `0` / `3`»). حذف این کاراکترها کاملاً بی‌خطر است — هیچ‌کدام تاثیری روی
+    محتوای عددی/متنی قابل‌مشاهده ندارند و فقط برای ساده‌ترشدن تطبیق ریجکس‌ها
+    حذف می‌شوند.
+    """
+    t = text or ""
+    t = t.replace("\u200c", " ")
+    for ch in ("\u200e", "\u200f", "\u061c", "`"):
+        t = t.replace(ch, "")
+    return t
 
 
 def parse_street_cats(text: str) -> Optional[int]:
@@ -511,6 +762,121 @@ def is_factory_in_progress(text: str) -> bool:
 
 
 # ══════════════════════════════════════════════════
+#  پارسرهای سیستم یخچال میویی
+# ══════════════════════════════════════════════════
+
+# ظرفیت یخچال — مثال: «🐟 ظرفیت یخچال : 2 / 2»
+FRIDGE_CAPACITY_RE = re.compile(r"ظرفیت\s*یخچال\s*:?\s*([\d,]+)\s*/\s*([\d,]+)")
+
+# «زمان مورد نیاز پخیدن : 1:58» — معمولاً MM:SS، اما HH:MM:SS هم پشتیبانی می‌شود
+COOK_DURATION_RE = re.compile(
+    r"زمان\s*مورد\s*نیاز\s*پخیدن\D{0,10}(\d{1,2}):(\d{2})(?::(\d{2}))?"
+)
+
+# «ارزش» به‌تنهایی (نه «ارزش غذایی») — لوک‌اِهد منفی مانع تطبیق با ارزش غذایی می‌شود
+FISH_VALUE_RE = re.compile(r"ارزش(?!\s*غذایی)\s*:?\s*([\d,]+)")
+
+# «ارزش غذایی : 5»
+FOOD_VALUE_RE = re.compile(r"ارزش\s*غذایی\D{0,10}([\d,]+)")
+
+# الگوی هدر هر ردیف یخچال — مثال: «🐙 | حماسی 🔡 | (پخته شده 🐟)» یا «🦑 | حماسی 🔡 | (خام)»
+_FRIDGE_HEADER_RE = re.compile(
+    "(" + "|".join(re.escape(e) for e in FRIDGE_CREATURE_EMOJIS) + r")"
+    r"\s*\|[^\n|]*\|\s*\(([^)]*)\)"
+)
+
+
+def parse_fridge_capacity(text: str) -> Optional[Tuple[int, int]]:
+    """استخراج (ظرفیت‌فعلی، ظرفیت‌حداکثر) از پیام یخچال میویی."""
+    m = FRIDGE_CAPACITY_RE.search(_normalize(text))
+    if not m:
+        return None
+    return int(m.group(1).replace(",", "")), int(m.group(2).replace(",", ""))
+
+
+def parse_fish_emoji(text: str) -> Optional[str]:
+    """
+    تشخیص ایموجی نوع ماهی/موجود دریایی از هر جای متن — بر اساس اسکن روی
+    FRIDGE_CREATURE_EMOJIS، نه یک اندیس یا فرمت ثابت. افزودن نوع جدید فقط با
+    افزودن ایموجی به آن آرایه ممکن می‌شود، بدون تغییر این تابع.
+    """
+    t = text or ""
+    for emo in FRIDGE_CREATURE_EMOJIS:
+        if emo in t:
+            return emo
+    return None
+
+
+def parse_fish_value(text: str) -> Optional[int]:
+    """ارزش پولی ماهی («💰 ارزش : 1,144 🪙») — با «ارزش غذایی» اشتباه گرفته نمی‌شود."""
+    m = FISH_VALUE_RE.search(_normalize(text))
+    return int(m.group(1).replace(",", "")) if m else None
+
+
+def parse_food_value(text: str) -> Optional[int]:
+    """ارزش غذایی ماهی («🍖 ارزش غذایی : 5»)."""
+    m = FOOD_VALUE_RE.search(_normalize(text))
+    return int(m.group(1).replace(",", "")) if m else None
+
+
+def parse_cook_duration(text: str) -> Optional[int]:
+    """زمان موردنیاز برای پخته‌شدن ماهی، به ثانیه."""
+    m = COOK_DURATION_RE.search(_normalize(text))
+    if not m:
+        return None
+    parts = [g for g in m.groups() if g is not None]
+    if len(parts) == 3:
+        h, mn, s = (int(x) for x in parts)
+        return h * 3600 + mn * 60 + s
+    if len(parts) == 2:
+        mn, s = (int(x) for x in parts)
+        return mn * 60 + s
+    return None
+
+
+def is_cooked_label(text: str) -> bool:
+    """آیا برچسب وضعیت ماهی «پخته شده» است؟"""
+    return "پخته" in _normalize(text)
+
+
+def is_fridge_empty(text: str) -> bool:
+    """آیا پیام یخچال میویی صراحتاً «یخچال خالی است» را نشان می‌دهد؟"""
+    return "یخچال خالی است" in _normalize(text)
+
+
+def parse_fridge_entries(text: str) -> List[dict]:
+    """
+    استخراج کامل لیست ماهی‌های داخل یخچال، به همان ترتیبی که در متن ظاهر
+    می‌شوند (مورد ۵/۶) — هر آیتم: emoji، cooked (bool)، weight، value، food_value.
+
+    این پارسر بر اساس *موقعیت هر ایموجی در متن* عمل می‌کند، نه اندیس ثابت؛
+    بنابراین کاملاً با ترتیب دکمه‌های آنانیم (که به همین ترتیب متن ظاهر می‌شوند)
+    قابل تطبیق است. افزودن یک نوع ماهی جدید فقط با افزودن ایموجی‌اش به
+    FRIDGE_CREATURE_EMOJIS ممکن می‌شود، بدون تغییر این تابع.
+    """
+    t = _normalize(text)
+    headers = list(_FRIDGE_HEADER_RE.finditer(t))
+    entries: List[dict] = []
+    for i, hm in enumerate(headers):
+        start = hm.end()
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(t)
+        block = t[start:end]
+
+        weight_m = re.search(r"وزن\s*:\s*([\d.]+)", block)
+        value_m = FISH_VALUE_RE.search(block)
+        food_m = FOOD_VALUE_RE.search(block)
+
+        entries.append({
+            "emoji": hm.group(1),
+            "cooked": is_cooked_label(hm.group(2) or ""),
+            "weight": float(weight_m.group(1)) if weight_m else None,
+            "value": int(value_m.group(1).replace(",", "")) if value_m else None,
+            "food_value": int(food_m.group(1).replace(",", "")) if food_m else None,
+        })
+    return entries
+
+
+# ══════════════════════════════════════════════════
 #  کش نام گروه‌ها (مورد ۷/۸) — get_entity با مدیریت خطا
 # ══════════════════════════════════════════════════
 
@@ -545,14 +911,19 @@ async def resolve_group_name(gid: int) -> str:
     return result
 
 
-async def format_group_block(label: str, gid: int) -> str:
+async def format_group_block(label: str, gid: Optional[int]) -> str:
     """
     قالب نمایش یک گروه به‌صورت:
         🐱 گروه میو:
         └─ NameOrError
         └─ -1003380347106
     (مورد ۷)
+
+    اگر گروه اصلاً ست نشده باشد (gid=None)، بدون هیچ تماس شبکه‌ای اضافه‌ای،
+    دقیقاً GROUP_NOT_SET_TEXT نمایش داده می‌شود.
     """
+    if gid is None:
+        return f"{label}:\n└─ {GROUP_NOT_SET_TEXT}"
     name = await resolve_group_name(gid)
     return f"{label}:\n└─ {name}\n└─ {gid}"
 
@@ -569,7 +940,7 @@ async def format_rescue_groups_block(gids: List[int]) -> str:
         └─ -1002222222222
     """
     if not gids:
-        return "🏘 گروه‌های خیابونی:\n└─ (هیچ گروهی تنظیم نشده)"
+        return f"🏘 گروه‌های خیابونی:\n└─ {GROUP_NOT_SET_TEXT}"
 
     lines = ["🏘 گروه‌های خیابونی:"]
     for gid in gids:
@@ -712,6 +1083,29 @@ def _first_button_text(msg: Message) -> str:
 
 
 # ══════════════════════════════════════════════════
+#  موقعیت دکمه‌های آنانیم یخچال (بدون هیچ متنی)
+# ══════════════════════════════════════════════════
+#
+# طبق تایید صریح کاربر: این دکمه‌ها اصلاً متن ندارند و فقط بر اساس «موقعیت»
+# شناسایی می‌شوند — نه با اسکن‌کردن پیام برای دکمه‌های خالی. قانون دقیق:
+#   • اگر دکمه‌ی متنی «ارتقا سطح یخچال» در پیام نباشد:
+#       ماهی اول → ردیف ۰ ستون ۰ | ماهی دوم → ردیف ۰ ستون ۱ | ...
+#   • اگر آن دکمه باشد (ردیف ۰ را اشغال کرده):
+#       ماهی اول → ردیف ۱ ستون ۰ | ماهی دوم → ردیف ۱ ستون ۱ | ...
+# یعنی ستون همیشه = ایندکس ماهی در لیست متن (0-based)، و فقط ردیف بر اساس
+# وجود/عدم‌وجود دکمه‌ی ارتقا بین ۰ و ۱ جابه‌جا می‌شود.
+
+FRIDGE_UPGRADE_BUTTON_TEXT = "ارتقا سطح یخچال"
+
+
+def fridge_fish_button_position(msg: Message, fish_index: int) -> Tuple[int, int]:
+    """موقعیت (ردیف, ستون) دکمه‌ی آنانیمِ متناظر با fish_index-امین ماهیِ لیست متن."""
+    has_upgrade = get_button(msg, text=FRIDGE_UPGRADE_BUTTON_TEXT) is not None
+    row = 1 if has_upgrade else 0
+    return row, fish_index
+
+
+# ══════════════════════════════════════════════════
 #  منوی سلف
 # ══════════════════════════════════════════════════
 
@@ -756,6 +1150,12 @@ def build_menu() -> str:
         "گروه اختصاصی کارخونه میویی\n\n"
         "▫️ .تایم_کارخونه [ثانیه]\n"
         "تنظیم دستی و فوری تایمر کارخونه (بدون نیاز به ریستارت)\n\n"
+        "▫️ .حداقل_ارزش_غذایی [عدد]\n"
+        "حداقل ارزش غذایی ماهی برای ذخیره در یخچال (پیش‌فرض 5)\n\n"
+        "▫️ .حداکثر_ارزش_ماهی [عدد]\n"
+        "سقف ارزش ماهیِ پخته‌شده برای تغذیه؛ بالاتر از این مقدار فروخته می‌شود (پیش‌فرض 5000)\n\n"
+        "▫️ .گروه_یخچال [آیدی]\n"
+        "گروه اختصاصی یخچال میویی\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "🔌 کنترل ماژول‌ها\n\n"
         "▫️ .سلف روشن   ▫️ .سلف خاموش\n"
@@ -764,7 +1164,8 @@ def build_menu() -> str:
         "▫️ .ماهیگیری روشن   ▫️ .ماهیگیری خاموش\n"
         "▫️ .خیابونی روشن   ▫️ .خیابونی خاموش\n"
         "▫️ .قاچاق روشن   ▫️ .قاچاق خاموش\n"
-        "▫️ .کارخونه روشن   ▫️ .کارخونه خاموش\n\n"
+        "▫️ .کارخونه روشن   ▫️ .کارخونه خاموش\n"
+        "▫️ .یخچال روشن   ▫️ .یخچال خاموش\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "💡 نمونه استفاده\n\n"
         ".میو 340\n"
@@ -775,11 +1176,23 @@ def build_menu() -> str:
         ".حداکثر_قاچاق 15\n"
         ".حداقل_قیمت_فروش 55\n"
         ".گروه_قاچاق -1001234567890\n"
-        ".تایم_کارخونه 6000\n\n"
+        ".تایم_کارخونه 6000\n"
+        ".یخچال روشن\n"
+        ".گروه_یخچال -1001234567890\n"
+        ".حداقل_ارزش_غذایی 5\n"
+        ".حداکثر_ارزش_ماهی 5000\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "📌 سیستم هوشمند ماهیگیری\n\n"
         "اگر مقدار شکم کمتر از حد تعیین‌شده باشد، ماهی به گربه داده می‌شود؛ "
-        "در غیر این صورت به‌صورت خودکار فروخته خواهد شد."
+        "در غیر این صورت به‌صورت خودکار فروخته خواهد شد.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📌 سیستم هوشمند یخچال میویی\n\n"
+        "وقتی «یخچال» روشن باشد و گزینه‌ی «بندازش تو یخچال» در ماهیگیری ظاهر شود، "
+        "ربات فقط زمانی ماهی را داخل یخچال می‌گذارد که: ارزش غذایی‌اش حداقل به‌اندازه "
+        "«.حداقل_ارزش_غذایی» باشد، از قبل هم‌نوعش در یخچال نباشد، و ظرفیت یخچال پر نباشد. "
+        "سپس ربات به‌طور خودکار پخت را شروع کرده و پس از اتمام، اگر شکم گربه کم و ارزش "
+        "ماهیِ پخته‌شده زیر «.حداکثر_ارزش_ماهی» باشد آن را به گربه می‌دهد، در غیر این صورت "
+        "می‌فروشد. اگر «یخچال» خاموش باشد، ماهیگیری دقیقاً طبق روال سابق (فروش/تغذیه فوری) ادامه می‌یابد."
     )
 
 
@@ -790,33 +1203,43 @@ async def build_status() -> str:
     threshold = cfg_int("stomach")
     stomach = get_stomach()
 
-    g_meow    = get_group("group_meow", DEFAULT_MEOW_GROUP)
-    g_pishi   = get_group("group_pishi", DEFAULT_PISHI_GROUP)
-    g_fish    = get_group("group_fish", DEFAULT_FISH_GROUP)
-    g_rescue  = get_group_list("group_rescue", DEFAULT_RESCUE_GROUPS)
-    g_smuggle = get_group("smuggling_group", DEFAULT_SMUGGLING_GROUP)
-    g_factory = get_group("factory_group", DEFAULT_FACTORY_GROUP)
+    g_meow    = get_group("group_meow")
+    g_pishi   = get_group("group_pishi")
+    g_fish    = get_group("group_fish")
+    g_rescue  = get_group_list("group_rescue")
+    g_smuggle = get_group("smuggling_group")
+    g_factory = get_group("factory_group")
+    g_fridge  = get_group("refrigerator_group")
 
     smuggling_wait = cfg_int("smuggling_wait_sec", 1800)
     factory_wait   = cfg_int("factory_wait_sec", 3600)
 
-    self_on      = cfg_bool("self_enabled")
-    meow_on      = cfg_bool("meow_enabled")
-    pishi_on     = cfg_bool("pishi_enabled")
-    fishing_on   = cfg_bool("fishing_enabled")
-    rescue_on    = cfg_bool("rescue_enabled")
-    smuggling_on = cfg_bool("smuggling_enabled")
-    factory_on   = cfg_bool("factory_enabled")
+    self_on         = cfg_bool("self_enabled")
+    meow_on         = cfg_bool("meow_enabled", False)
+    pishi_on        = cfg_bool("pishi_enabled", False)
+    fishing_on      = cfg_bool("fishing_enabled", False)
+    rescue_on       = cfg_bool("rescue_enabled", False)
+    smuggling_on    = cfg_bool("smuggling_enabled", False)
+    factory_on      = cfg_bool("factory_enabled", False)
+    refrigerator_on = cfg_bool("refrigerator_enabled", False)
 
     # مورد ۷: نام گروه‌ها کنار آیدی — همه با get_entity، خطاها هندل می‌شوند
+    # (و اگر گروهی ست نشده باشد، بدون تماس شبکه‌ای، GROUP_NOT_SET_TEXT نمایش داده می‌شود)
     meow_block    = await format_group_block("🐱 گروه میو", g_meow)
     pishi_block   = await format_group_block("🐾 گروه پیشی", g_pishi)
     fish_block    = await format_group_block("🎣 گروه ماهیگیری", g_fish)
     smuggle_block = await format_group_block("📦 گروه قاچاق", g_smuggle)
     factory_block = await format_group_block("🏭 گروه کارخونه", g_factory)
+    fridge_block  = await format_group_block("🧊 گروه یخچال", g_fridge)
 
     # مورد ۸: نمایش کامل گروه‌های خیابونی (بدون خلاصه‌سازی به تعداد)
     rescue_block = await format_rescue_groups_block(g_rescue)
+
+    fridge_food_min  = cfg_int("refrigerator_food_value_min", 5)
+    fridge_value_max = cfg_int("refrigerator_fish_value_max", 5000)
+    fridge_cap_max   = cfg_int("fridge_capacity_max", 0)
+    fridge_cap_cur   = table_count("meow_refrigerator")
+    fridge_cap_disp  = f"{fridge_cap_cur} / {fridge_cap_max}" if fridge_cap_max > 0 else f"{fridge_cap_cur} / نامشخص (هنوز سینک نشده)"
 
     return (
         "🤖 وضعیت کامل ربات\n"
@@ -827,7 +1250,8 @@ async def build_status() -> str:
         f"ماهیگیری: {onoff(fishing_on)}\n"
         f"خیابونی: {onoff(rescue_on)}\n"
         f"قاچاق: {onoff(smuggling_on)}\n"
-        f"کارخونه: {onoff(factory_on)}\n\n"
+        f"کارخونه: {onoff(factory_on)}\n"
+        f"یخچال: {onoff(refrigerator_on)}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🍖 شکم فعلی: {stomach}\n"
         f"🎯 آستانه شکم: {threshold}\n\n"
@@ -837,16 +1261,21 @@ async def build_status() -> str:
         f"{rescue_block}\n\n"
         f"{smuggle_block}\n\n"
         f"{factory_block}\n\n"
+        f"{fridge_block}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🔢 حداقل قاچاق: {cfg_int('smuggling_min')}\n"
         f"🔢 حداکثر قاچاق: {cfg_int('smuggling_max')}\n"
-        f"💰 حداقل قیمت فروش: {cfg_int('min_sell_price')}\n\n"
+        f"💰 حداقل قیمت فروش (کارخونه): {cfg_int('min_sell_price')}\n\n"
+        f"🧊 ظرفیت یخچال: {fridge_cap_disp}\n"
+        f"🍖 حداقل ارزش غذایی ذخیره در یخچال: {fridge_food_min}\n"
+        f"💰 حداکثر ارزش ماهی برای تغذیه: {fridge_value_max}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"⏱ میو (هر {mi} ثانیه)\n └─ مانده: {fmt_timer_line('meow', mi, meow_on)}\n\n"
         f"⏱ پیشی (هر {pi} ثانیه)\n └─ مانده: {fmt_timer_line('pishi', pi, pishi_on)}\n\n"
         f"⏱ ماهیگیری (هر {fi} ثانیه)\n └─ مانده: {fmt_timer_line('fishing', fi, fishing_on)}\n\n"
         f"⏱ قاچاق\n └─ مانده: {fmt_timer_line('smuggling', smuggling_wait, smuggling_on)}\n\n"
-        f"⏱ تولید کارخونه\n └─ مانده: {fmt_timer_line('factory', factory_wait, factory_on)}"
+        f"⏱ تولید کارخونه\n └─ مانده: {fmt_timer_line('factory', factory_wait, factory_on)}\n\n"
+        f"⏱ یخچال\n └─ مانده: {fmt_fridge_timer_line()}"
     )
 
 
@@ -860,11 +1289,11 @@ def build_timers() -> str:
     si = cfg_int("smuggling_wait_sec", 1800)
     ki = cfg_int("factory_wait_sec", 3600)
 
-    meow_on      = cfg_bool("meow_enabled")
-    pishi_on     = cfg_bool("pishi_enabled")
-    fishing_on   = cfg_bool("fishing_enabled")
-    smuggling_on = cfg_bool("smuggling_enabled")
-    factory_on   = cfg_bool("factory_enabled")
+    meow_on      = cfg_bool("meow_enabled", False)
+    pishi_on     = cfg_bool("pishi_enabled", False)
+    fishing_on   = cfg_bool("fishing_enabled", False)
+    smuggling_on = cfg_bool("smuggling_enabled", False)
+    factory_on   = cfg_bool("factory_enabled", False)
 
     return (
         "⏳ تایمرهای فعال سیستم ⏳\n"
@@ -873,7 +1302,8 @@ def build_timers() -> str:
         f"🐾 ارسال پیشی بعدی:\n └─ {fmt_timer_line('pishi', pi, pishi_on)}\n\n"
         f"🎣 ارسال ماهی بعدی:\n └─ {fmt_timer_line('fishing', fi, fishing_on)}\n\n"
         f"📦 سیکل بعدی قاچاق:\n └─ {fmt_timer_line('smuggling', si, smuggling_on)}\n\n"
-        f"🏭 سیکل بعدی کارخونه:\n └─ {fmt_timer_line('factory', ki, factory_on)}"
+        f"🏭 سیکل بعدی کارخونه:\n └─ {fmt_timer_line('factory', ki, factory_on)}\n\n"
+        f"🧊 یخچال:\n └─ {fmt_fridge_timer_line()}"
     )
 
 
@@ -898,6 +1328,10 @@ SETTER_COMMANDS = {
     "گروه_کارخونه":    ("factory_group", "group", "گروه کارخونه"),
     # مورد ۲: دستور جدید تنظیم دستی تایمر کارخونه
     "تایم_کارخونه":   ("factory_wait_sec", "int", "تایمر دستی کارخونه"),
+    # ── یخچال میویی ──
+    "حداقل_ارزش_غذایی": ("refrigerator_food_value_min", "int", "حداقل ارزش غذایی برای ذخیره در یخچال"),
+    "حداکثر_ارزش_ماهی": ("refrigerator_fish_value_max", "int", "حداکثر ارزش ماهی برای تغذیه"),
+    "گروه_یخچال":        ("refrigerator_group", "group", "گروه یخچال میویی"),
 }
 
 TOGGLE_COMMANDS = {
@@ -908,6 +1342,7 @@ TOGGLE_COMMANDS = {
     "خیابونی":   "rescue_enabled",
     "قاچاق":     "smuggling_enabled",
     "کارخونه":   "factory_enabled",
+    "یخچال":     "refrigerator_enabled",
 }
 
 # کلیدهایی که با تغییرشان باید یک اقدام لحظه‌ای اضافه (غیر از صرفِ cfg_set) انجام شود
@@ -931,6 +1366,12 @@ async def handle_command(event) -> None:
     cmd = parts[0].strip()
     rest = parts[1].strip() if len(parts) > 1 else ""
 
+    # فیلتر پیام تک‌نقطه‌ای: اگر بعد از حذف نقطه چیزی جز فاصله باقی نماند
+    # (یعنی پیام دقیقاً «.» یا «. » و مشابه بود)، کاملاً و بی‌سروصدا نادیده گرفته
+    # می‌شود — نه پاسخی، نه پیام «دستور نامعتبر است».
+    if not cmd:
+        return
+
     try:
         if cmd == "وضعیت":
             await event.edit(await build_status()); return
@@ -943,6 +1384,13 @@ async def handle_command(event) -> None:
             new_val = rest == "روشن"
             cfg_bool_set(db_key, new_val)
             log.info(f"[TOGGLE] ماژول '{cmd}' → {onoff(new_val)}")
+
+            # طبق درخواست کاربر: هر بار یخچال روشن می‌شود، دیتابیس محلی کاملاً
+            # ریست می‌شود تا سینک از صفر و کامل با یخچال واقعی انجام شود.
+            if db_key == "refrigerator_enabled" and new_val:
+                fridge_reset_all()
+                log.info("[FRIDGE] به‌خاطر روشن‌شدن مجدد ماژول، لیست یخچال به‌طور کامل ریست شد.")
+
             await event.edit(f"✅ {cmd} {onoff(new_val)} شد.")
             return
 
@@ -1035,7 +1483,11 @@ async def meow_loop() -> None:
             continue
 
         text = random.choice(choices)
-        target = get_group("group_meow", DEFAULT_MEOW_GROUP)
+        target = get_group("group_meow")
+        if target is None:
+            log.warning("[MEOW] گروه میو تنظیم نشده — رد شد.")
+            await asyncio.sleep(interval)
+            continue
 
         sent = await safe_send(target, text)
         if sent:
@@ -1060,7 +1512,11 @@ async def pishi_loop() -> None:
             continue
 
         interval = cfg_int("pishi_sec", 1480)
-        target = get_group("group_pishi", DEFAULT_PISHI_GROUP)
+        target = get_group("group_pishi")
+        if target is None:
+            log.warning("[PISHI] گروه پیشی تنظیم نشده — رد شد.")
+            await asyncio.sleep(interval)
+            continue
 
         try:
             sent = await safe_send(target, PISHI_MSG_TEXT)
@@ -1088,6 +1544,69 @@ async def pishi_loop() -> None:
         await asyncio.sleep(interval)
 
 
+async def try_store_in_fridge(msg: Message, catch_text: str, fish_group: int) -> bool:
+    """
+    بررسی ۴ شرط ذخیره در یخچال (سند یخچال، مورد ۴) روی متن پیام صید ماهی:
+      ۱) ماژول یخچال روشن باشد — این را خودِ فراخوان (fishing_loop) از قبل چک می‌کند.
+      ۲) ارزش غذایی ماهی ≥ آستانه‌ی تنظیم‌شده (.حداقل_ارزش_غذایی).
+      ۳) نوع ماهی (ایموجی) از قبل در یخچال (محلی) نباشد.
+      ۴) ظرفیت یخچال پر نباشد.
+    در صورت برقرار بودن همه، روی «بندازش تو یخچال» کلیک و ماهی در دیتابیس محلی
+    ثبت می‌شود (وضعیت 'raw'). سپس — طبق درخواست کاربر — بلافاصله (بدون منتظر
+    ماندن برای دور بعدی fridge_loop) فرآیند شروع پخت هم در همین‌جا اجرا می‌شود.
+    خروجی: True یعنی ماهی به یخچال منتقل شد؛ False یعنی fishing_loop باید طبق
+    روال سابق (فروش/تغذیه فوری) ادامه دهد.
+    """
+    food_val = parse_food_value(catch_text)
+    fish_emo = parse_fish_emoji(catch_text)
+    food_threshold = cfg_int("refrigerator_food_value_min", 5)
+
+    cur_count = table_count("meow_refrigerator")
+    max_cap = cfg_int("fridge_capacity_max", 0)
+
+    cond_food = food_val is not None and food_val >= food_threshold
+    cond_species = fish_emo is not None
+    cond_dup = cond_species and not fridge_has(fish_emo)
+    cond_room = max_cap > 0 and cur_count < max_cap
+
+    log.info(
+        f"[FRIDGE] بررسی شروط ذخیره | ارزش‌غذایی={food_val} (آستانه={food_threshold}) "
+        f"| گونه={fish_emo} | غیرتکراری={'بله' if cond_dup else 'خیر'} "
+        f"| ظرفیت={cur_count}/{max_cap or '؟'}"
+    )
+
+    if not (cond_food and cond_species and cond_dup and cond_room):
+        log.info("[FRIDGE] شروط ذخیره در یخچال برقرار نبود — روال عادی فروش/تغذیه ادامه می‌یابد.")
+        return False
+
+    clicked = await click_by_text(msg, FRIDGE_STORE_BUTTON)
+    if not clicked:
+        log.warning("[FRIDGE] کلیک روی «بندازش تو یخچال» ناموفق بود (احتمالاً این دکمه در این صید موجود نبود).")
+        return False
+
+    fridge_add(fish_emo)
+    log.info(f"[FRIDGE] ماهی '{fish_emo}' با موفقیت به یخچال منتقل شد ✓ — بلافاصله شروع پخت را امتحان می‌کنیم.")
+
+    # طبق درخواست کاربر: به‌جای صبر برای دور بعدی fridge_loop، همین الان تلاش
+    # می‌کنیم فرآیند پخت را شروع کنیم. یک مکث کوتاه می‌دهیم تا پیام «بندازش تو
+    # یخچال» واقعاً روی سرور بازی اعمال شده باشد.
+    await asyncio.sleep(2)
+    try:
+        started = await fridge_initiate_cook(fish_group, fish_emo)
+        fridge_record_attempt(fish_emo, started)
+        if started:
+            log.info(f"[FRIDGE] پخت ماهی '{fish_emo}' بلافاصله بعد از ذخیره شروع شد ✓")
+        else:
+            log.info(
+                f"[FRIDGE] شروع فوری پخت برای '{fish_emo}' موفق نشد — fridge_loop در دورهای "
+                f"بعدی دوباره تلاش می‌کند."
+            )
+    except Exception as e:
+        log.error(f"[FRIDGE] خطا در تلاش برای شروع فوری پخت '{fish_emo}': {e}")
+
+    return True
+
+
 async def fishing_loop() -> None:
     interval = cfg_int("fish_sec", 1500)
     wait = secs_left("fishing", interval)
@@ -1102,7 +1621,11 @@ async def fishing_loop() -> None:
 
         interval = cfg_int("fish_sec", 1500)
         threshold = cfg_int("stomach", 7)
-        target = get_group("group_fish", DEFAULT_FISH_GROUP)
+        target = get_group("group_fish")
+        if target is None:
+            log.warning("[FISH] گروه ماهیگیری تنظیم نشده — رد شد.")
+            await asyncio.sleep(interval)
+            continue
 
         try:
             sent = await safe_send(target, FISH_MSG_TEXT)
@@ -1114,16 +1637,32 @@ async def fishing_loop() -> None:
             set_last_run("fishing", time.time())
             log.info(f"[FISH] پیام ارسال شد → {target} (id={sent.id}) | منتظر پاسخ بات...")
 
-            msg = await wait_for_reply(target, sent.id, {SELL_FISH_BUTTON, GIVE_TO_CAT_BUTTON})
+            # مورد ۴ سند یخچال: علاوه بر دکمه‌های سابق، احتمال وجود دکمه‌ی
+            # «بندازش تو یخچال» را هم در انتظار پاسخ لحاظ می‌کنیم.
+            msg = await wait_for_reply(
+                target, sent.id, {SELL_FISH_BUTTON, GIVE_TO_CAT_BUTTON, FRIDGE_STORE_BUTTON}
+            )
             if msg:
-                stomach = get_stomach()
-                target_btn = GIVE_TO_CAT_BUTTON if stomach < threshold else SELL_FISH_BUTTON
-                log.info(f"[FISH] شکم={stomach} آستانه={threshold} → '{target_btn}'")
-                await click_by_text(msg, target_btn)
-                if target_btn == SELL_FISH_BUTTON:
-                    log.info("[FISH] Fish Sold")
-                else:
-                    log.info("[FISH] Fish Given To Cat")
+                catch_text = msg.text or ""
+                used_fridge = False
+
+                if cfg_bool("refrigerator_enabled", False):
+                    fridge_group = get_group("refrigerator_group")
+                    if fridge_group is not None:
+                        used_fridge = await try_store_in_fridge(msg, catch_text, fridge_group)
+                    else:
+                        log.warning("[FRIDGE] گروه یخچال تنظیم نشده — ذخیره در یخچال رد شد.")
+
+                if not used_fridge:
+                    # بک‌آپ: روال دقیقاً طبق سابق (یخچال خاموش بود یا این صید واجد شرایط نبود)
+                    stomach = get_stomach()
+                    target_btn = GIVE_TO_CAT_BUTTON if stomach < threshold else SELL_FISH_BUTTON
+                    log.info(f"[FISH] شکم={stomach} آستانه={threshold} → '{target_btn}'")
+                    await click_by_text(msg, target_btn)
+                    if target_btn == SELL_FISH_BUTTON:
+                        log.info("[FISH] Fish Sold")
+                    else:
+                        log.info("[FISH] Fish Given To Cat")
             else:
                 log.warning("[FISH] پیام پاسخ پیدا نشد.")
         except Exception as e:
@@ -1137,7 +1676,10 @@ async def fishing_loop() -> None:
 # ══════════════════════════════════════════════════
 
 async def smuggling_cycle() -> str:
-    group = get_group("smuggling_group", DEFAULT_SMUGGLING_GROUP)
+    group = get_group("smuggling_group")
+    if group is None:
+        log.warning("[SMUGGLE] گروه قاچاق تنظیم نشده — رد شد.")
+        return "retry"
 
     sent = await safe_send(group, SMUGGLE_TRIGGER)
     if not sent:
@@ -1290,7 +1832,10 @@ async def factory_cycle() -> str:
     refresh یا ورود به منوی دیگر، و بدون هیچ عملیاتی که احتمال لغو تولید در حال
     انجام را داشته باشد. این چک باید *قبل* از هرگونه کلیک روی پیام انجام شود.
     """
-    group = get_group("factory_group", DEFAULT_FACTORY_GROUP)
+    group = get_group("factory_group")
+    if group is None:
+        log.warning("[FACTORY] گروه کارخونه تنظیم نشده — رد شد.")
+        return "retry"
 
     sent = await safe_send(group, FACTORY_TRIGGER)
     if not sent:
@@ -1444,7 +1989,10 @@ async def factory_price_watch_loop() -> None:
             continue
 
         try:
-            group = get_group("factory_group", DEFAULT_FACTORY_GROUP)
+            group = get_group("factory_group")
+            if group is None:
+                log.warning("[FACTORY-PRICE] گروه کارخونه تنظیم نشده — رد شد.")
+                continue
             await factory_warehouse_check(group)
         except Exception as e:
             log.error(f"[FACTORY-PRICE] خطا: {e}")
@@ -1481,70 +2029,354 @@ async def factory_loop() -> None:
 
 
 # ══════════════════════════════════════════════════
+#  سیستم یخچال میویی (loop مستقل)
+# ══════════════════════════════════════════════════
+#
+# این حلقه، مانند smuggling_loop/factory_loop، کاملاً مستقل و پایدار است.
+# مسئولیت‌ها عمداً از fishing_loop جدا شده‌اند (اصل «جداسازی ماژولار»):
+#   • fishing_loop فقط تصمیم می‌گیرد که آیا ماهیِ تازه‌صید‌شده باید داخل
+#     یخچال گذاشته شود یا نه، و در صورت مثبت بودن فقط کلیک اولیه را می‌زند
+#     و ماهی را با وضعیت 'raw' در جدول محلی ثبت می‌کند.
+#   • تمام مراحل بعدی — شروع پخت، انتظار برای اتمام پخت، جمع‌آوری و تصمیم
+#     نهایی فروش/تغذیه — به‌طور کامل توسط همین حلقه مدیریت می‌شود.
+# چون تمام وضعیت (raw/cooking/cooked + cook_ready_at) در جدول
+# meow_refrigerator ذخیره شده و هر دور دوباره از دیتابیس خوانده می‌شود، این
+# حلقه در برابر ری‌استارت ربات کاملاً مقاوم است — نیازی به نگه‌داشتن هیچ
+# وضعیتی در حافظه نیست.
+
+
+def _sync_capacity_from_text(text: str) -> None:
+    """در صورت وجود «ظرفیت یخچال : X / Y» در متن، مقدار حداکثر (Y) را در کانفیگ به‌روز می‌کند."""
+    cap = parse_fridge_capacity(text)
+    if cap is not None:
+        _, mx = cap
+        if mx > 0:
+            cfg_set("fridge_capacity_max", str(mx))
+
+
+async def fridge_sync_if_empty(group: int) -> None:
+    """
+    مورد ۳ سند یخچال: اگر جدول محلی یخچال کاملاً خالی باشد و هنوز سینکی روی این
+    دوره‌ی «روشن بودن» ماژول انجام نشده باشد، پیام «یخچال میویی» ارسال و از روی
+    پاسخ، ظرفیت و لیست موجودی فعلی سینک می‌شود.
+
+    این کار *دقیقاً یک‌بار* در هر دوره‌ی روشن‌بودنِ ماژول انجام می‌شود — چه
+    یخچال واقعی چیزی داشته باشد چه خالی باشد، نتیجه فرقی نمی‌کند: بعد از یک
+    تلاش، پرچم fridge_synced_once ست می‌شود و دیگر تا زمانی که کاربر دوباره
+    «.یخچال خاموش» و «.یخچال روشن» نزند (که fridge_reset_all این پرچم را پاک
+    می‌کند)، هیچ سینک خودکار دیگری انجام نمی‌شود.
+    """
+    if cfg_bool("fridge_synced_once", False):
+        return
+    if table_count("meow_refrigerator") != 0:
+        return
+
+    cfg_bool_set("fridge_synced_once", True)  # قبل از تلاش ست می‌شود تا هرگز دوباره تکرار نشود
+
+    sent = await safe_send(group, FRIDGE_TRIGGER)
+    if not sent:
+        log.warning(f"[FRIDGE] ارسال «{FRIDGE_TRIGGER}» برای سینک اولیه ناموفق بود — دیگر خودکار تکرار نمی‌شود.")
+        return
+    msg = await wait_for_bot_message(group, sent.id)
+    if not msg:
+        log.warning("[FRIDGE] پاسخی برای سینک اولیه یخچال دریافت نشد — دیگر خودکار تکرار نمی‌شود.")
+        return
+
+    text = msg.text or ""
+    _sync_capacity_from_text(text)
+
+    if is_fridge_empty(text):
+        log.info("[FRIDGE] سینک انجام شد | یخچال واقعاً خالی است — هیچ ماهی‌ای برای افزودن نبود.")
+        return
+
+    entries = parse_fridge_entries(text)
+    for e in entries:
+        if not e["emoji"]:
+            continue
+        fridge_add(e["emoji"])
+        if e["cooked"]:
+            fridge_set_status(e["emoji"], "cooked")
+    log.info(f"[FRIDGE] سینک اولیه انجام شد | {len(entries)} ماهی شناسایی شد.")
+
+
+async def fridge_initiate_cook(group: int, emo: str) -> bool:
+    """
+    مورد ۵ سند یخچال: ورود به گروه یخچال، پیدا کردن دکمه‌ی مربوط به ماهی 'emo'
+    بر اساس ترتیب آن در متن، کلیک روی آن و سپس تایید شروع پخت.
+
+    موقعیت دکمه (طبق تایید صریح کاربر): دکمه‌ها هیچ متنی ندارند و فقط بر اساس
+    «موقعیت» مشخص می‌شوند — نه با اسکن‌کردن پیام برای دکمه‌های خالی:
+      • اگر دکمه‌ی متنیِ «ارتقا سطح یخچال» نبود → ماهیِ اول = (ردیف۰, ستون۰)
+      • اگر آن دکمه بود (ردیف۰ را اشغال کرده) → ماهیِ اول = (ردیف۱, ستون۰)
+    در هر دو حالت، ستون = ایندکس ماهی در لیست متن (fridge_fish_button_position).
+    """
+    sent = await safe_send(group, FRIDGE_TRIGGER)
+    if not sent:
+        log.warning(f"[FRIDGE] ارسال «{FRIDGE_TRIGGER}» برای شروع پخت ناموفق بود.")
+        return False
+
+    msg = await wait_for_bot_message(group, sent.id)
+    if not msg:
+        log.warning("[FRIDGE] پاسخی برای شروع پخت دریافت نشد.")
+        return False
+
+    listing_text = msg.text or ""
+    _sync_capacity_from_text(listing_text)
+
+    if is_fridge_empty(listing_text):
+        log.warning(
+            f"[FRIDGE] یخچال واقعی خالی است ولی دیتابیس محلی ماهی '{emo}' را دارد — "
+            f"رکورد محلی ناهماهنگ حذف شد (خودترمیمی)."
+        )
+        fridge_remove(emo)
+        return False
+
+    entries = parse_fridge_entries(listing_text)
+    idx = next((i for i, e in enumerate(entries) if e["emoji"] == emo), None)
+    if idx is None:
+        log.warning(f"[FRIDGE] ماهی '{emo}' در لیست یخچال پیدا نشد — منتظر سینک بعدی می‌مانیم.")
+        return False
+
+    row, col = fridge_fish_button_position(msg, idx)
+    btn = get_button(msg, row=row, col=col)
+    if btn is None:
+        log.warning(f"[FRIDGE] دکمه‌ی متناظر با ماهی '{emo}' در موقعیت (ردیف={row}, ستون={col}) پیدا نشد.")
+        return False
+
+    if not await raw_click(msg, btn):
+        log.warning(f"[FRIDGE] کلیک روی دکمه‌ی ماهی '{emo}' (ردیف={row}, ستون={col}) ناموفق بود.")
+        return False
+
+    fresh = await refresh_message(group, msg.id)
+    if not fresh:
+        log.warning("[FRIDGE] پیام صفحه‌ی مشخصات ماهی دریافت نشد.")
+        return False
+
+    detail_text = fresh.text or ""
+
+    # اگر متن هنوز به‌روزرسانی نشده (پخیدن شروع نشده)، دنبال جدیدترین پیام بات بگرد
+    if "پخیدن" not in detail_text and "زمان مورد نیاز" not in detail_text:
+        newer = await wait_for_bot_message(group, msg.id, timeout=10)
+        if newer:
+            fresh = newer
+            detail_text = fresh.text or ""
+
+    cook_dur = parse_cook_duration(detail_text)
+    if cook_dur is None:
+        cook_dur = 120
+        log.warning(f"[FRIDGE] زمان پخت برای '{emo}' پارس نشد — از fallback {cook_dur} ثانیه استفاده شد.")
+
+        
+    detail_text = fresh.text or ""
+    cook_dur = parse_cook_duration(detail_text)
+    if cook_dur is None:
+        cook_dur = 120  # fallback ایمن — اگر زمان از متن پارس نشد
+        log.warning(f"[FRIDGE] زمان پخت برای '{emo}' پارس نشد — از fallback {cook_dur} ثانیه استفاده شد.")
+
+    # تایید شروع پخت: مطابق الگوی موجود در factory_cycle، کلیک «موقعیتی» (۰,۰)
+    # اصل ماجراست؛ متن fallback فقط برای مقاومت در برابر جابه‌جایی موقعیت است.
+    await click_button(fresh, 2, 0, fallback_text=FRIDGE_COOK_CONFIRM_TEXT)
+
+    confirm_msg = await refresh_message(group, fresh.id)
+    if confirm_msg:
+        await click_button(confirm_msg, 0, 0, fallback_text=None)
+
+    now = time.time()
+    fridge_set_status(emo, "cooking", cook_started_at=now, cook_ready_at=now + cook_dur)
+    log.info(f"[FRIDGE] پخت ماهی '{emo}' آغاز شد | زمان لازم={fmt_time(cook_dur)}")
+    return True
+
+
+async def fridge_collect_cooked(group: int, emo: str) -> bool:
+    """جمع‌آوری ماهی پخته‌شده + تصمیم فروش یا تغذیه"""
+    sent = await safe_send(group, FRIDGE_TRIGGER)
+    if not sent:
+        log.warning(f"[FRIDGE] ارسال پیام یخچال ناموفق")
+        return False
+
+    msg = await wait_for_bot_message(group, sent.id)
+    if not msg:
+        return False
+
+    listing_text = msg.text or ""
+    _sync_capacity_from_text(listing_text)
+
+    if is_fridge_empty(listing_text):
+        log.warning(f"[FRIDGE] ماهی '{emo}' دیگر در یخچال نیست — حذف محلی")
+        fridge_remove(emo)
+        return False
+
+    entries = parse_fridge_entries(listing_text)
+    idx = next((i for i, e in enumerate(entries) if e["emoji"] == emo), None)
+    if idx is None:
+        log.warning(f"[FRIDGE] ماهی '{emo}' در لیست پیدا نشد")
+        return False
+
+    # باز کردن صفحه ماهی
+    row, col = fridge_fish_button_position(msg, idx)
+    if not await raw_click(msg, get_button(msg, row=row, col=col)):
+        log.warning(f"[FRIDGE] کلیک روی ماهی '{emo}' ناموفق")
+        return False
+
+    fresh = await refresh_message(group, msg.id, tries=8, delay=0.8)
+    if not fresh:
+        return False
+
+    detail_text = fresh.text or ""
+    if not is_cooked_label(detail_text):
+        log.info(f"[FRIDGE] ماهی هنوز پخته نشده")
+        return False
+
+    fish_value = parse_fish_value(detail_text)
+    stomach = get_stomach()
+    stomach_threshold = cfg_int("stomach", 7)
+    value_threshold = cfg_int("refrigerator_fish_value_max", 5000)
+
+    feed = (stomach < stomach_threshold) and (fish_value is not None and fish_value < value_threshold)
+    target_btn_text = GIVE_TO_CAT_BUTTON if feed else SELL_FISH_BUTTON
+
+    log.info(
+        f"[FRIDGE] ماهی '{emo}' آماده | ارزش={fish_value} | شکم={stomach} → "
+        f"{'تغذیه' if feed else 'فروش'}"
+    )
+
+    # === کلیک موقعیتی (قوی‌تر) ===
+    success = False
+    
+    if feed:
+        # بده پیشی بخوره → ردیف 1، ستون 0
+        success = await click_button(fresh, 1, 0)
+    else:
+        # فروش ماهی → ردیف 0، ستون 0
+        success = await click_button(fresh, 0, 0)
+
+    # fallback متنی در صورت شکست
+    if not success:
+        success = await click_by_text(fresh, target_btn_text)
+
+    if success:
+        log.info(f"[FRIDGE] ✅ اقدام موفق: {target_btn_text}")
+        fridge_remove(emo)
+        return True
+    else:
+        log.error(f"[FRIDGE] ❌ هر دو روش کلیک (موقعیتی + متنی) شکست خورد برای '{target_btn_text}'")
+        # ماهی را حذف نمی‌کنیم تا دور بعدی دوباره تلاش کند
+        return False
+
+
+async def fridge_loop() -> None:
+    """
+    حلقه‌ی مدیریت کامل چرخه‌ی یخچال میویی. هر دور *فقط یک* اقدام انجام می‌دهد
+    (جمع‌آوری، یا شروع پخت، یا سینک) — هرگز بیش از یکی در یک دور، تا از ارسال
+    پی‌درپی چند پیام به گروه یخچال در عرض چند ثانیه جلوگیری شود.
+
+    اگر ماهی‌ای در یخچال واقعی پیدا نشود (ناهماهنگی دیتابیس محلی)، به‌جای تلاش
+    بی‌وقفه در هر دور، یک backoff اعمال می‌شود (fridge_should_attempt) تا حداکثر
+    هر FRIDGE_MISS_BACKOFF_SEC ثانیه یک‌بار دوباره امتحان شود، و بعد از
+    FRIDGE_MISS_GIVE_UP بار شکست پیاپی، دیگر خودکار تلاش نمی‌شود (نیاز به بررسی
+    دستی — احتمالاً یعنی آن ماهی دیگر واقعاً در یخچال بازی وجود ندارد).
+    """
+    while True:
+        if not cfg_bool("refrigerator_enabled", False):
+            await asyncio.sleep(5)
+            continue
+
+        group = get_group("refrigerator_group")
+        if group is None:
+            log.warning("[FRIDGE] گروه یخچال تنظیم نشده — رد شد.")
+            await asyncio.sleep(cfg_int("fridge_poll_sec", FRIDGE_DEFAULT_POLL))
+            continue
+
+        try:
+            due_now = [e for e in fridge_due_now() if fridge_should_attempt(e)]
+            if due_now:
+                emo = due_now[0]
+                ok = await fridge_collect_cooked(group, emo)
+                fridge_record_attempt(emo, ok)
+                if not ok:
+                    log.warning(
+                        f"[FRIDGE] ماهی '{emo}' در یخچال واقعی پیدا نشد — احتمالاً دیتابیس "
+                        f"محلی با بازی هماهنگ نیست. تا {FRIDGE_MISS_BACKOFF_SEC} ثانیه دیگر "
+                        f"دوباره امتحان می‌شود (حداکثر {FRIDGE_MISS_GIVE_UP} بار)."
+                    )
+            else:
+                raw_pending = [e for e in fridge_list_raw() if fridge_should_attempt(e)]
+                if raw_pending:
+                    emo = raw_pending[0]
+                    ok = await fridge_initiate_cook(group, emo)
+                    fridge_record_attempt(emo, ok)
+                    if not ok:
+                        log.warning(
+                            f"[FRIDGE] ماهی '{emo}' برای شروع پخت در یخچال واقعی پیدا نشد — "
+                            f"تا {FRIDGE_MISS_BACKOFF_SEC} ثانیه دیگر دوباره امتحان می‌شود "
+                            f"(حداکثر {FRIDGE_MISS_GIVE_UP} بار)."
+                        )
+                elif table_count("meow_refrigerator") == 0:
+                    await fridge_sync_if_empty(group)
+        except Exception as e:
+            log.error(f"[FRIDGE] خطای غیرمنتظره در حلقه یخچال: {e}")
+
+        # فاصله‌ی خواب: طبق fridge_poll_sec، مگر این‌که یک پخت واقعاً زودتر آماده شود
+        sleep_for = cfg_int("fridge_poll_sec", FRIDGE_DEFAULT_POLL)
+        next_ready = fridge_next_ready_at()
+        if next_ready is not None:
+            remaining = next_ready - time.time()
+            if 0 < remaining < sleep_for:
+                sleep_for = remaining + 2
+
+        await asyncio.sleep(max(3, sleep_for))
+
+
+# ══════════════════════════════════════════════════
 #  Rescue Listener — با پشتیبانی از بروزرسانی لحظه‌ای (مورد ۱۰)
 # ══════════════════════════════════════════════════
-
-async def safe_click(msg, row, col):
-    """یک تابع کمکی برای فرستادن کلیک‌های پس‌زمینه بدون ایجاد خطای سرخود چت"""
-    try:
-        await msg.click(row, col)
-    except Exception:
-        pass  # ارورهای غیب شدن دکمه رو نادیده بگیر تا لاگ کثیف نشه
-
-async def safe_reaction(chat_id, msg_id, emojilist):
-    """یک تابع کمکی برای فرستادن ری‌اکشن بدون کرش دادن برنامه"""
-    try:
-        await client(SendReactionRequest(peer=chat_id, msg_id=msg_id, reaction=emojilist))
-    except Exception:
-        pass
 
 async def sniper_click(msg: Message, action_type: str):
     raw_text = msg.text or ""
 
     if ("یک پیشی خیابونی توی شهر پیدا شد" in raw_text or "لطفا به پیشی" in raw_text) and "نجات داد" not in raw_text:
-        log.info(f"🎯 [پیشی شکار شد!] ──> شروع فاز اول ترکیبی (تایمرهای میلی‌ثانیه‌ای امن)...")
         
-        # ۱. ری‌اکشن قلب اول
-        client.loop.create_task(safe_reaction(msg.chat_id, msg.id, [ReactionEmoji(emoticon='❤️')]))
-        await asyncio.sleep(0.05) # ۵ صدم ثانیه تاخیر برای دور زدن فلود تلگرام
-
-        # ۲. کلیک اول
-        client.loop.create_task(safe_click(msg, 0, 0))
-        await asyncio.sleep(0.05)
-
-        # ۳. حذف ری‌اکشن اول
-        client.loop.create_task(safe_reaction(msg.chat_id, msg.id, []))
-        await asyncio.sleep(0.05)
-
-        # ۴. کلیک دوم
-        client.loop.create_task(safe_click(msg, 0, 0))
-        await asyncio.sleep(0.05)
-
-        # ۵. ری‌اکشن قلب دوم
-        client.loop.create_task(safe_reaction(msg.chat_id, msg.id, [ReactionEmoji(emoticon='❤️')]))
-        await asyncio.sleep(0.05)
-
-        # ۶. کلیک سوم
-        client.loop.create_task(safe_click(msg, 0, 0))
-        await asyncio.sleep(0.05)
-
-        # ۷. حذف ری‌اکشن دوم
-        client.loop.create_task(safe_reaction(msg.chat_id, msg.id, []))
-        await asyncio.sleep(0.05)
-
-        client.loop.create_task(safe_reaction(msg.chat_id, msg.id, [ReactionEmoji(emoticon='❤️')]))
+        log.info(f"🎯 [پیشی شکار شد!] ──> شروع فاز اول ترکیبی (کلیک + ری‌اکشن)...")
         
-        
+        try:
+            # ۱. ری‌اکشن قلب اول
+            await client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[ReactionEmoji(emoticon='❤️')]))
+            await asyncio.sleep(0.3)
+
+            # ۲. کلیک اول
+            await msg.click(0, 0)
+            await asyncio.sleep(0.5)
+
+            # ۳. حذف ری‌اکشن اول
+            await client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[]))
+            await asyncio.sleep(0.5)
+
+            # ۴. کلیک دوم
+            await msg.click(0, 0)
+            await asyncio.sleep(0.5)
+
+            # ۵. ری‌اکشن قلب دوم
+            await client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[ReactionEmoji(emoticon='❤️')]))
+            await asyncio.sleep(0.5)
+
+            # ۶. کلیک سوم
+            await msg.click(0, 0)
+            await asyncio.sleep(0.5)
+
+            # ۷. حذف ری‌اکشن دوم
+            await client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[]))
+            
+            log.info("⚡️ فاز اول ترکیبی با موفقیت انجام شد.")
+
+        except Exception as e:
+            log.error(f"خطا در شلیک اولیه: {e}")
         # ----------------------------------------
         # مهلت به سرور بازی و آپدیت وضعیت پیام
-        await asyncio.sleep(0.8)
-        try:
-            msg = await client.get_messages(msg.chat_id, ids=msg.id)
-        except Exception:
-            return False
+        await asyncio.sleep(1.0)
+        msg = await client.get_messages(msg.chat_id, ids=msg.id)
 
         # 🛡 فاز دوم (پیگیری امن در صورت غیب نشدن دکمه)
-        if msg and msg.buttons:
+        if msg.buttons:
             log.info("⚠️ دکمه هنوز هست؛ ورود به فاز دوم (۱۵ کلیک امن با تایمر)...")
             max_attempts = 15
             attempt = 0
@@ -1552,14 +2384,15 @@ async def sniper_click(msg: Message, action_type: str):
             while msg.buttons and attempt < max_attempts:
                 attempt += 1
                 try:
-                    client.loop.create_task(safe_click(msg, 0, 0))
-                    await asyncio.sleep(0.6) # افزایش جزیی تایمر برای امنیت بیشتر اکانت
+                    client.loop.create_task(msg.click(0, 0))
+                    await asyncio.sleep(0.5)
                     msg = await client.get_messages(msg.chat_id, ids=msg.id)
-                except Exception:
+                except Exception as e:
+                    log.error(f"❌ خطا در فاز دوم: {e}")
                     break
 
         # نتیجه نهایی
-        if not msg or not msg.buttons:
+        if not msg.buttons:
             log.info("✅ عالیه! دکمه با موفقیت غیب شد.")
             return True
         else:
@@ -1601,15 +2434,18 @@ async def rescue_listener() -> None:
             except Exception as e:
                 log.warning(f"[RESCUE] خطا در حذف هندلر قدیمی: {e}")
 
-    rescue_groups = get_group_list("group_rescue", DEFAULT_RESCUE_GROUPS)
+    rescue_groups = get_group_list("group_rescue")
     current_handlers = _register(rescue_groups)
-    log.info(f"[RESCUE] لیسنر خیابونی ثبت شد برای گروه‌ها: {rescue_groups}")
+    if rescue_groups:
+        log.info(f"[RESCUE] لیسنر خیابونی ثبت شد برای گروه‌ها: {rescue_groups}")
+    else:
+        log.warning(f"[RESCUE] هیچ گروه خیابونی‌ای ست نشده — {GROUP_NOT_SET_TEXT} (لیسنر با لیست خالی ثبت شد).")
 
     while True:
         await rescue_groups_changed.wait()
         rescue_groups_changed.clear()
 
-        new_groups = get_group_list("group_rescue", DEFAULT_RESCUE_GROUPS)
+        new_groups = get_group_list("group_rescue")
         log.info(f"[RESCUE] تغییر گروه‌های خیابونی شناسایی شد — بروزرسانی لیسنر بدون ریستارت.")
 
         _unregister(current_handlers)
@@ -1646,17 +2482,18 @@ async def main() -> None:
 
     log.info(f"[SYSTEM] اکانت متصل شد: {me.first_name} (@{me.username})")
     log.info(f"[SYSTEM] بات‌های هدف (آینه): {', '.join(sorted(TARGET_BOTS))}")
-    log.info(f"[SYSTEM] گروه میو: {get_group('group_meow', DEFAULT_MEOW_GROUP)}")
-    log.info(f"[SYSTEM] گروه پیشی: {get_group('group_pishi', DEFAULT_PISHI_GROUP)}")
-    log.info(f"[SYSTEM] گروه ماهیگیری: {get_group('group_fish', DEFAULT_FISH_GROUP)}")
-    log.info(f"[SYSTEM] گروه‌های خیابونی: {get_group_list('group_rescue', DEFAULT_RESCUE_GROUPS)}")
-    log.info(f"[SYSTEM] گروه قاچاق: {get_group('smuggling_group', DEFAULT_SMUGGLING_GROUP)}")
-    log.info(f"[SYSTEM] گروه کارخونه: {get_group('factory_group', DEFAULT_FACTORY_GROUP)}")
+    log.info(f"[SYSTEM] گروه میو: {get_group('group_meow') or GROUP_NOT_SET_TEXT}")
+    log.info(f"[SYSTEM] گروه پیشی: {get_group('group_pishi') or GROUP_NOT_SET_TEXT}")
+    log.info(f"[SYSTEM] گروه ماهیگیری: {get_group('group_fish') or GROUP_NOT_SET_TEXT}")
+    log.info(f"[SYSTEM] گروه‌های خیابونی: {get_group_list('group_rescue') or GROUP_NOT_SET_TEXT}")
+    log.info(f"[SYSTEM] گروه قاچاق: {get_group('smuggling_group') or GROUP_NOT_SET_TEXT}")
+    log.info(f"[SYSTEM] گروه کارخونه: {get_group('factory_group') or GROUP_NOT_SET_TEXT}")
+    log.info(f"[SYSTEM] گروه یخچال: {get_group('refrigerator_group') or GROUP_NOT_SET_TEXT}")
     log.info(f"[SYSTEM] شکم فعلی: {get_stomach()}")
     log.info(f"[SYSTEM] سلف={onoff(cfg_bool('self_enabled'))} میو={onoff(cfg_bool('meow_enabled'))} "
              f"پیشی={onoff(cfg_bool('pishi_enabled'))} ماهیگیری={onoff(cfg_bool('fishing_enabled'))} "
              f"خیابونی={onoff(cfg_bool('rescue_enabled'))} قاچاق={onoff(cfg_bool('smuggling_enabled'))} "
-             f"کارخونه={onoff(cfg_bool('factory_enabled'))}")
+             f"کارخونه={onoff(cfg_bool('factory_enabled'))} یخچال={onoff(cfg_bool('refrigerator_enabled'))}")
     log.info(f"[SYSTEM] ربات فعال شد — برای منو در تلگرام {MENU_TRIGGER} را ارسال کنید.\n")
 
     await asyncio.gather(
@@ -1667,6 +2504,7 @@ async def main() -> None:
         smuggling_loop(),
         factory_loop(),
         factory_price_watch_loop(),
+        fridge_loop(),
         command_listener(),
     )
 
