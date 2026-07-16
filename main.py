@@ -147,7 +147,15 @@ DEFAULT_TOGGLES = {
     "fridge_synced_once":   "0",
 }
 
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+client = TelegramClient(
+    SESSION_NAME,
+    API_ID,
+    API_HASH,
+    auto_reconnect=True,
+    connection_retries=None,   # None = تلاش نامحدود برای وصل‌شدن مجدد
+    retry_delay=1,              # ثانیه بین هر تلاش reconnect
+    request_retries=5,          # تعداد retry خودِ Telethon برای هر درخواست
+)
 
 # رویداد داخلی برای اطلاع‌رسانی به rescue_listener که لیست گروه‌های خیابونی تغییر کرده
 rescue_groups_changed = asyncio.Event()
@@ -612,9 +620,36 @@ def fmt_fridge_timer_line() -> str:
 BLOCKED = (ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError)
 
 
+async def ensure_connected() -> bool:
+    """
+    اگر کلاینت disconnect شده باشه، فعالانه سعی می‌کنه وصلش کنه (به‌جای این‌که
+    فقط منتظر بمونه Telethon خودش reconnect کنه). برمی‌گردونه True اگر در نهایت
+    وصل بود، False اگر بعد از چند تلاش هم نشد.
+    """
+    if client.is_connected():
+        return True
+    log.warning("[SYSTEM] کلاینت قطع شده — تلاش برای اتصال مجدد...")
+    for attempt in range(5):
+        try:
+            await client.connect()
+            if client.is_connected():
+                log.info("[SYSTEM] اتصال مجدد موفق شد.")
+                return True
+        except Exception as e:
+            log.error(f"[SYSTEM] تلاش {attempt + 1} برای اتصال مجدد ناموفق بود: {e}")
+        await asyncio.sleep(min(2 ** attempt, 20))
+    log.error("[SYSTEM] اتصال مجدد پس از چند تلاش ناموفق بود.")
+    return False
+
+
 async def safe_send(gid: int, text: str, retries: int = 3) -> Optional[Message]:
     for attempt in range(retries):
         try:
+            if not client.is_connected():
+                connected = await ensure_connected()
+                if not connected:
+                    await asyncio.sleep(5)
+                    continue
             msg = await client.send_message(gid, text)
             return msg
         except BLOCKED as e:
@@ -625,6 +660,10 @@ async def safe_send(gid: int, text: str, retries: int = 3) -> Optional[Message]:
             await asyncio.sleep(e.seconds + 5)
         except PersistentTimestampOutdatedError:
             await asyncio.sleep(10 * (attempt + 1))
+        except (ConnectionError, OSError) as e:
+            log.error(f"[SYSTEM] قطعی اتصال هنگام ارسال پیام: {e}")
+            await ensure_connected()
+            await asyncio.sleep(3)
         except Exception as e:
             log.error(f"[SYSTEM] خطا در ارسال پیام: {e}")
             await asyncio.sleep(5)
@@ -2328,6 +2367,36 @@ async def fridge_loop() -> None:
 
 
 # ══════════════════════════════════════════════════
+#  نگهبان اتصال — مانیتور دائمی وضعیت کانکشن (مستقل از بقیه حلقه‌ها)
+# ══════════════════════════════════════════════════
+
+async def connection_watchdog() -> None:
+    """
+    هر چند ثانیه یک‌بار چک می‌کند که کلاینت واقعاً وصل است یا نه. اگر قطع بود،
+    فعالانه client.connect() را صدا می‌زند تا در وضعیت «نیمه‌مرده» (نه کاملاً
+    قطع که خودش reconnect کند، نه واقعاً وصل) برای همیشه گیر نکند و دیگر نیازی
+    به ری‌استارت دستی نباشد.
+    """
+    fail_streak = 0
+    while True:
+        try:
+            if not client.is_connected():
+                fail_streak += 1
+                log.warning(
+                    f"[WATCHDOG] کلاینت قطع تشخیص داده شد (تلاش شماره {fail_streak}) — "
+                    "در حال اتصال مجدد..."
+                )
+                await ensure_connected()
+            else:
+                if fail_streak:
+                    log.info("[WATCHDOG] اتصال دوباره پایدار شد.")
+                fail_streak = 0
+        except Exception as e:
+            log.error(f"[WATCHDOG] خطای غیرمنتظره: {e}")
+        await asyncio.sleep(10)
+
+
+# ══════════════════════════════════════════════════
 #  Rescue Listener — با پشتیبانی از بروزرسانی لحظه‌ای (مورد ۱۰)
 # ══════════════════════════════════════════════════
 
@@ -2506,6 +2575,7 @@ async def main() -> None:
         factory_price_watch_loop(),
         fridge_loop(),
         command_listener(),
+        connection_watchdog(),
     )
 
 
